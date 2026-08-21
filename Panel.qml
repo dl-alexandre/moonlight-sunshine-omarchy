@@ -253,6 +253,7 @@ Panel {
             width: parent.width - refreshButton.width - addHostHeaderButton.width - settingsButton.width - Style.space(24)
             spacing: Style.space(2)
             Text {
+              textFormat: Text.PlainText
               text: "Sunshine hosts"
               color: Color.foreground
               font.family: Style.font.family
@@ -260,6 +261,7 @@ Panel {
               font.bold: true
             }
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: root.statusText
               color: Color.foreground
@@ -279,6 +281,7 @@ Panel {
               ? Style.hoverFillFor(Color.foreground, Color.accent)
               : Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.08)
             Text {
+              textFormat: Text.PlainText
               anchors.centerIn: parent
               text: root.refreshing ? "…" : "󰑐"
               color: Color.foreground
@@ -303,6 +306,7 @@ Panel {
               ? Style.hoverFillFor(Color.foreground, Color.accent)
               : Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.08)
             Text {
+              textFormat: Text.PlainText
               anchors.centerIn: parent
               text: "+"
               color: Color.foreground
@@ -327,6 +331,7 @@ Panel {
               ? Style.hoverFillFor(Color.foreground, Color.accent)
               : Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.08)
             Text {
+              textFormat: Text.PlainText
               anchors.centerIn: parent
               text: "󰒓"
               color: Color.foreground
@@ -360,6 +365,7 @@ Panel {
             spacing: Style.space(7)
 
             Text {
+              textFormat: Text.PlainText
               text: "Connection settings"
               color: Color.foreground
               opacity: 0.68
@@ -373,6 +379,7 @@ Panel {
               spacing: Style.space(7)
 
               Text {
+                textFormat: Text.PlainText
                 text: "Profile"
                 width: Style.space(52)
                 color: Color.foreground
@@ -397,7 +404,7 @@ Panel {
                 color: profileAddMouse.containsMouse
                   ? Style.hoverFillFor(Color.foreground, Color.accent)
                   : Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.08)
-                Text { anchors.centerIn: parent; text: "+"; color: Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.body }
+                Text { anchors.centerIn: parent; textFormat: Text.PlainText; text: "+"; color: Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.body }
                 MouseArea {
                   id: profileAddMouse
                   anchors.fill: parent
@@ -413,6 +420,7 @@ Panel {
               spacing: Style.space(7)
 
               Text {
+                textFormat: Text.PlainText
                 text: "Preset"
                 width: Style.space(52)
                 color: Color.foreground
@@ -454,7 +462,7 @@ Panel {
             height: profileNameField.height
             radius: Style.cornerRadius
             color: Color.accent
-            Text { anchors.centerIn: parent; text: "Create"; color: Color.background; font.family: Style.font.family; font.pixelSize: Style.font.caption; font.bold: true }
+            Text { anchors.centerIn: parent; textFormat: Text.PlainText; text: "Create"; color: Color.background; font.family: Style.font.family; font.pixelSize: Style.font.caption; font.bold: true }
             MouseArea { anchors.fill: parent; onClicked: root.addProfile() }
           }
         }
@@ -476,6 +484,7 @@ Panel {
             spacing: Style.space(7)
 
             Text {
+              textFormat: Text.PlainText
               text: root.hostFormEditing ? "Edit saved host" : "Add Sunshine host"
               color: Color.foreground
               font.family: Style.font.family
@@ -533,7 +542,7 @@ Panel {
                 height: Style.spacing.controlHeight
                 radius: Style.cornerRadius
                 color: root.hostFormFavorite ? Color.accent : Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.08)
-                Text { anchors.centerIn: parent; text: root.hostFormFavorite ? "★ Favorite" : "☆ Favorite"; color: root.hostFormFavorite ? Color.background : Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.caption }
+                Text { anchors.centerIn: parent; textFormat: Text.PlainText; text: root.hostFormFavorite ? "★ Favorite" : "☆ Favorite"; color: root.hostFormFavorite ? Color.background : Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.caption }
                 MouseArea { anchors.fill: parent; onClicked: root.hostFormFavorite = !root.hostFormFavorite }
               }
               Rectangle {
@@ -541,7 +550,7 @@ Panel {
                 height: Style.spacing.controlHeight
                 radius: Style.cornerRadius
                 color: Color.accent
-                Text { anchors.centerIn: parent; text: "Save"; color: Color.background; font.family: Style.font.family; font.pixelSize: Style.font.caption; font.bold: true }
+                Text { anchors.centerIn: parent; textFormat: Text.PlainText; text: "Save"; color: Color.background; font.family: Style.font.family; font.pixelSize: Style.font.caption; font.bold: true }
                 MouseArea { anchors.fill: parent; onClicked: root.saveHost() }
               }
               Rectangle {
@@ -549,7 +558,7 @@ Panel {
                 height: Style.spacing.controlHeight
                 radius: Style.cornerRadius
                 color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.08)
-                Text { anchors.centerIn: parent; text: "Cancel"; color: Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.caption }
+                Text { anchors.centerIn: parent; textFormat: Text.PlainText; text: "Cancel"; color: Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.caption }
                 MouseArea { anchors.fill: parent; onClicked: root.closeHostForm() }
               }
             }
@@ -562,6 +571,7 @@ Panel {
           height: Style.space(68)
           color: "transparent"
           Text {
+            textFormat: Text.PlainText
             anchors.fill: parent
             text: "No hosts in this profile yet. Use Add host to save a LAN or VPN address, or keep Sunshine running and refresh discovery."
             color: Color.foreground
@@ -598,6 +608,7 @@ Panel {
                 width: parent.width
                 spacing: Style.space(8)
                 Text {
+                  textFormat: Text.PlainText
                   width: parent.width - stateBadge.width - Style.space(8)
                   text: hostCard.modelData.name || hostCard.modelData.address
                   color: Color.foreground
@@ -617,6 +628,7 @@ Panel {
                     : Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.08)
                   anchors.verticalCenter: parent.verticalCenter
                   Text {
+                    textFormat: Text.PlainText
                     id: stateBadgeText
                     anchors.centerIn: parent
                     text: hostCard.modelData.online ? "ONLINE" : (hostCard.modelData.saved ? "SAVED" : "OFFLINE")
@@ -633,6 +645,7 @@ Panel {
                 width: parent.width
                 spacing: Style.space(5)
                 Text {
+                  textFormat: Text.PlainText
                   text: hostCard.modelData.address
                   color: Color.foreground
                   opacity: 0.62
@@ -642,6 +655,7 @@ Panel {
                   width: parent.width - defaultAppText.implicitWidth - presetChip.width - Style.space(15)
                 }
                 Text {
+                  textFormat: Text.PlainText
                   text: "·"
                   color: Color.foreground
                   opacity: 0.4
@@ -649,6 +663,7 @@ Panel {
                   font.pixelSize: Style.font.caption
                 }
                 Text {
+                  textFormat: Text.PlainText
                   id: defaultAppText
                   text: hostCard.modelData.app
                   color: Color.foreground
@@ -665,6 +680,7 @@ Panel {
                   radius: height / 2
                   color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.07)
                   Text {
+                    textFormat: Text.PlainText
                     id: presetChipText
                     anchors.centerIn: parent
                     text: hostCard.modelData.preset || ""
@@ -689,7 +705,7 @@ Panel {
                   color: streamMouse.containsMouse
                     ? Style.hoverFillFor(Color.foreground, Color.accent)
                     : Color.accent
-                  Text { anchors.centerIn: parent; text: "Stream"; color: Color.background; font.family: Style.font.family; font.pixelSize: Style.font.caption; font.bold: true }
+                  Text { anchors.centerIn: parent; textFormat: Text.PlainText; text: "Stream"; color: Color.background; font.family: Style.font.family; font.pixelSize: Style.font.caption; font.bold: true }
                   MouseArea {
                     id: streamMouse
                     anchors.fill: parent
@@ -707,7 +723,7 @@ Panel {
                   color: appsMouse.containsMouse
                     ? Style.hoverFillFor(Color.foreground, Color.accent)
                     : Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.08)
-                  Text { anchors.centerIn: parent; text: "Apps"; color: Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.caption }
+                  Text { anchors.centerIn: parent; textFormat: Text.PlainText; text: "Apps"; color: Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.caption }
                   MouseArea {
                     id: appsMouse
                     anchors.fill: parent
@@ -725,7 +741,7 @@ Panel {
                   color: pairMouse.containsMouse
                     ? Style.hoverFillFor(Color.foreground, Color.accent)
                     : Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.08)
-                  Text { anchors.centerIn: parent; text: "Pair"; color: Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.caption }
+                  Text { anchors.centerIn: parent; textFormat: Text.PlainText; text: "Pair"; color: Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.caption }
                   MouseArea {
                     id: pairMouse
                     anchors.fill: parent
@@ -748,6 +764,7 @@ Panel {
                       ? Style.hoverFillFor(Color.foreground, Color.accent)
                       : Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.08)
                     Text {
+                      textFormat: Text.PlainText
                       id: appLabel
                       anchors.centerIn: parent
                       text: modelData
@@ -779,7 +796,7 @@ Panel {
                   color: favoriteMouse.containsMouse
                     ? Style.hoverFillFor(Color.foreground, Color.accent)
                     : "transparent"
-                  Text { anchors.centerIn: parent; text: hostCard.modelData.favorite ? "★ Favorite" : "☆ Favorite"; color: Color.foreground; opacity: hostCard.modelData.saved ? 0.72 : 0.35; font.family: Style.font.family; font.pixelSize: Style.font.caption }
+                  Text { anchors.centerIn: parent; textFormat: Text.PlainText; text: hostCard.modelData.favorite ? "★ Favorite" : "☆ Favorite"; color: Color.foreground; opacity: hostCard.modelData.saved ? 0.72 : 0.35; font.family: Style.font.family; font.pixelSize: Style.font.caption }
                   MouseArea {
                     id: favoriteMouse
                     anchors.fill: parent
@@ -797,7 +814,7 @@ Panel {
                   color: editMouse.containsMouse
                     ? Style.hoverFillFor(Color.foreground, Color.accent)
                     : "transparent"
-                  Text { anchors.centerIn: parent; text: hostCard.modelData.saved ? "Edit" : "Save"; color: Color.foreground; opacity: 0.68; font.family: Style.font.family; font.pixelSize: Style.font.caption }
+                  Text { anchors.centerIn: parent; textFormat: Text.PlainText; text: hostCard.modelData.saved ? "Edit" : "Save"; color: Color.foreground; opacity: 0.68; font.family: Style.font.family; font.pixelSize: Style.font.caption }
                   MouseArea {
                     id: editMouse
                     anchors.fill: parent
@@ -815,7 +832,7 @@ Panel {
                   color: forgetMouse.containsMouse
                     ? Style.hoverFillFor(Color.foreground, Color.accent)
                     : "transparent"
-                  Text { anchors.centerIn: parent; text: "Forget"; color: Color.foreground; opacity: 0.5; font.family: Style.font.family; font.pixelSize: Style.font.caption }
+                  Text { anchors.centerIn: parent; textFormat: Text.PlainText; text: "Forget"; color: Color.foreground; opacity: 0.5; font.family: Style.font.family; font.pixelSize: Style.font.caption }
                   MouseArea {
                     id: forgetMouse
                     anchors.fill: parent
@@ -834,11 +851,12 @@ Panel {
           height: Style.spacing.controlHeight
           radius: Style.cornerRadius
           color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.08)
-          Text { anchors.centerIn: parent; text: "＋ Add host"; color: Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.caption }
+          Text { anchors.centerIn: parent; textFormat: Text.PlainText; text: "＋ Add host"; color: Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.caption }
           MouseArea { anchors.fill: parent; onClicked: root.beginAddHost(null) }
         }
 
         Text {
+          textFormat: Text.PlainText
           width: parent.width
           text: "Middle-click the bar icon to rescan · profiles keep LAN and VPN addresses separate"
           color: Color.foreground
