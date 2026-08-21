@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "dev.alexandre.moonlight-sunshine",
+  "name": "Moonlight Sunshine",
+  "version": "0.2.0",
+  "author": "Alexandre",
+  "license": "MIT",
+  "description": "Discover, favorite, organize, and launch Moonlight streams from Sunshine hosts.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Moonlight",
+    "description": "Manage Sunshine hosts, LAN/VPN profiles, apps, and streaming presets.",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

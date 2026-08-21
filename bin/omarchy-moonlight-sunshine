@@ -1,0 +1,681 @@
+#!/usr/bin/env python3
+"""Discover and launch Sunshine hosts from an Omarchy desktop."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_PORT = 47989
+SERVICE = "_nvstream._tcp"
+DEFAULT_PRESETS: dict[str, dict[str, Any]] = {
+    "Gaming": {
+        "resolution": "1440",
+        "fps": 120,
+        "bitrate": 50000,
+        "displayMode": "fullscreen",
+        "videoCodec": "auto",
+        "keepAwake": True,
+    },
+    "Desktop": {
+        "resolution": "1080",
+        "fps": 60,
+        "bitrate": 20000,
+        "displayMode": "borderless",
+        "videoCodec": "auto",
+        "keepAwake": False,
+    },
+    "Low bandwidth": {
+        "resolution": "720",
+        "fps": 30,
+        "bitrate": 8000,
+        "displayMode": "windowed",
+        "videoCodec": "H.264",
+        "keepAwake": False,
+    },
+    "Remote Desktop": {
+        "resolution": "1440",
+        "fps": 60,
+        "absoluteMouse": True,
+    },
+}
+CONFIG_PATH = (
+    Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    / "moonlight-sunshine"
+    / "hosts.json"
+)
+
+
+def fail(message: str, code: int = 1) -> int:
+    print(message, file=sys.stderr)
+    return code
+
+
+def load_config() -> dict[str, Any]:
+    if not CONFIG_PATH.exists():
+        return {
+            "activeProfile": "LAN",
+            "profiles": {"LAN": default_profile()},
+        }
+    try:
+        data = json.loads(CONFIG_PATH.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Cannot read {CONFIG_PATH}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Invalid config in {CONFIG_PATH}: expected an object")
+    # Migrate the original single-profile format without losing saved hosts.
+    if "profiles" not in data:
+        legacy_hosts = data.get("hosts", {})
+        if not isinstance(legacy_hosts, dict):
+            raise RuntimeError(f"Invalid config in {CONFIG_PATH}: hosts must be an object")
+        data = {
+            "activeProfile": "LAN",
+            "profiles": {
+                "LAN": {
+                    "defaultApp": str(data.get("defaultApp") or "Desktop"),
+                    "hosts": legacy_hosts,
+                    "presets": copy.deepcopy(DEFAULT_PRESETS),
+                }
+            },
+        }
+    if not isinstance(data.get("profiles"), dict) or not data["profiles"]:
+        raise RuntimeError(f"Invalid config in {CONFIG_PATH}: profiles must be a non-empty object")
+    for name, profile in data["profiles"].items():
+        if not isinstance(profile, dict):
+            data["profiles"][name] = default_profile()
+            continue
+        profile.setdefault("defaultApp", "Desktop")
+        profile.setdefault("hosts", {})
+        profile.setdefault("presets", copy.deepcopy(DEFAULT_PRESETS))
+        if not isinstance(profile["hosts"], dict):
+            raise RuntimeError(f"Invalid config in {CONFIG_PATH}: hosts in '{name}' must be an object")
+        if not isinstance(profile["presets"], dict):
+            profile["presets"] = copy.deepcopy(DEFAULT_PRESETS)
+        for preset_name, preset in DEFAULT_PRESETS.items():
+            profile["presets"].setdefault(preset_name, copy.deepcopy(preset))
+    if data.get("activeProfile") not in data["profiles"]:
+        data["activeProfile"] = next(iter(data["profiles"]))
+    return data
+
+
+def default_profile() -> dict[str, Any]:
+    return {
+        "defaultApp": "Desktop",
+        "hosts": {},
+        "presets": copy.deepcopy(DEFAULT_PRESETS),
+    }
+
+
+def active_profile(config: dict[str, Any], name: str | None = None) -> tuple[str, dict[str, Any]]:
+    profile_name = name or str(config.get("activeProfile") or "")
+    if profile_name not in config["profiles"]:
+        raise RuntimeError(f"Unknown profile '{profile_name}'")
+    return profile_name, config["profiles"][profile_name]
+
+
+def profile_for_command(config: dict[str, Any], name: str | None) -> tuple[str, dict[str, Any]]:
+    return active_profile(config, name)
+
+
+def save_config(data: dict[str, Any]) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = CONFIG_PATH.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    temp_path.replace(CONFIG_PATH)
+
+
+def clean(value: str) -> str:
+    return value.strip().rstrip(".")
+
+
+def parse_avahi(output: str) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    header = re.compile(r"^=\s+\S+\s+\S+\s+(.+?)\s+_nvstream\._tcp\s+local$")
+
+    def flush() -> None:
+        nonlocal current
+        if current and current.get("address"):
+            records.append(current)
+        current = None
+
+    for line in output.splitlines():
+        match = header.match(line.strip())
+        if match:
+            flush()
+            current = {"name": clean(match.group(1)), "port": DEFAULT_PORT}
+            continue
+        if current is None:
+            continue
+        property_match = re.match(r"^\s+(hostname|address|port)\s*=\s*\[?(.*?)\]?\s*$", line)
+        if not property_match:
+            continue
+        key, value = property_match.groups()
+        if key == "port":
+            try:
+                current[key] = int(value)
+            except ValueError:
+                current[key] = DEFAULT_PORT
+        else:
+            current[key] = clean(value)
+    flush()
+    return records
+
+
+def parse_dns_sd_browse(output: str) -> list[str]:
+    instances: list[str] = []
+    pattern = re.compile(r"\bAdd\s+\d+\s+\d+\s+(.+?)\s+_nvstream\._tcp\.\s+local\.?$")
+    for line in output.splitlines():
+        match = pattern.search(line.strip())
+        if match and match.group(1) not in instances:
+            instances.append(match.group(1))
+    return instances
+
+
+def discover_with_dns_sd(wait: float) -> list[dict[str, Any]]:
+    browse = subprocess.run(
+        ["dns-sd", "-B", SERVICE, "local"],
+        capture_output=True,
+        text=True,
+        timeout=max(1.0, wait) + 1.5,
+        check=False,
+    )
+    records: list[dict[str, Any]] = []
+    for instance in parse_dns_sd_browse(browse.stdout):
+        try:
+            lookup = subprocess.run(
+                ["dns-sd", "-L", instance, SERVICE, "local"],
+                capture_output=True,
+                text=True,
+                timeout=2.5,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            continue
+        match = re.search(r"can be reached at\s+([^\s:]+\.?):(\d+)", lookup.stdout)
+        if not match:
+            continue
+        records.append(
+            {
+                "name": instance,
+                "hostname": clean(match.group(1)),
+                "address": clean(match.group(1)),
+                "port": int(match.group(2)),
+            }
+        )
+    return records
+
+
+def discover(wait: float) -> tuple[list[dict[str, Any]], str | None]:
+    if shutil.which("avahi-browse"):
+        try:
+            result = subprocess.run(
+                ["avahi-browse", "-rt", SERVICE],
+                capture_output=True,
+                text=True,
+                timeout=max(1.0, wait) + 2.0,
+                check=False,
+            )
+            return normalize_records(parse_avahi(result.stdout)), None
+        except subprocess.TimeoutExpired as exc:
+            return normalize_records(parse_avahi(exc.stdout or "")), None
+
+    if shutil.which("dns-sd"):
+        try:
+            return normalize_records(discover_with_dns_sd(wait)), None
+        except subprocess.TimeoutExpired:
+            return [], "mDNS scan timed out"
+
+    return [], "Install avahi (Linux) or use macOS dns-sd for automatic discovery"
+
+
+def normalize_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse IPv4/IPv6 duplicates while preferring an IPv4 address."""
+    by_name: dict[str, dict[str, Any]] = {}
+    for record in records:
+        name = clean(str(record.get("name") or record.get("hostname") or "Sunshine host"))
+        address = clean(str(record.get("address") or record.get("hostname") or ""))
+        if not address:
+            continue
+        candidate = {
+            "name": name,
+            "hostname": clean(str(record.get("hostname") or address)),
+            "address": address,
+            "port": int(record.get("port") or DEFAULT_PORT),
+        }
+        key = name.casefold()
+        existing = by_name.get(key)
+        if existing is None or (":" in str(existing["address"]) and ":" not in address):
+            by_name[key] = candidate
+    return sorted(by_name.values(), key=lambda item: str(item["name"]).casefold())
+
+
+def endpoint(address: str, port: int = DEFAULT_PORT) -> str:
+    address = clean(address)
+    if ":" in address and not address.startswith("["):
+        address = f"[{address}]"
+    return address if port == DEFAULT_PORT else f"{address}:{port}"
+
+
+def parse_endpoint(value: str) -> tuple[str, int]:
+    value = value.strip()
+    if value.startswith("[") and "]" in value:
+        host, _, suffix = value[1:].partition("]")
+        return host, int(suffix[1:]) if suffix.startswith(":") and suffix[1:].isdigit() else DEFAULT_PORT
+    if value.count(":") == 1:
+        host, port = value.rsplit(":", 1)
+        if port.isdigit():
+            return host, int(port)
+    return value, DEFAULT_PORT
+
+
+def saved_host(profile: dict[str, Any], target: str) -> tuple[str, dict[str, Any]] | None:
+    for name, value in profile.get("hosts", {}).items():
+        if name.casefold() == target.casefold():
+            return name, value
+        if isinstance(value, dict) and str(value.get("label", "")).casefold() == target.casefold():
+            return name, value
+    return None
+
+
+def resolve_target(config: dict[str, Any], target: str, profile_name: str | None = None) -> tuple[str, int, str, dict[str, Any] | None]:
+    _, profile = profile_for_command(config, profile_name)
+    saved = saved_host(profile, target)
+    if saved:
+        name, value = saved
+        address = str(value.get("address", "")).strip()
+        if not address:
+            raise RuntimeError(f"Saved host '{name}' has no address")
+        port = int(value.get("port") or DEFAULT_PORT)
+        return address, port, name, value
+    address, port = parse_endpoint(target)
+    return address, port, target, None
+
+
+def snapshot(config: dict[str, Any], wait: float) -> dict[str, Any]:
+    profile_name, profile = active_profile(config)
+    discovered, discovery_error = discover(wait)
+    hosts: list[dict[str, Any]] = []
+    matched_discovered: set[str] = set()
+
+    def apps_for(value: dict[str, Any], default_app: str) -> list[str]:
+        raw_apps = value.get("apps", [])
+        if isinstance(raw_apps, str):
+            raw_apps = raw_apps.split(",")
+        apps = [str(item).strip() for item in raw_apps if str(item).strip()]
+        selected = str(value.get("app") or default_app).strip()
+        if selected and selected not in apps:
+            apps.insert(0, selected)
+        return apps or [default_app]
+
+    for saved_name, value in profile["hosts"].items():
+        if not isinstance(value, dict):
+            continue
+        address = str(value.get("address", "")).strip()
+        if not address:
+            continue
+        port = int(value.get("port") or DEFAULT_PORT)
+        match = next(
+            (
+                item
+                for item in discovered
+                if item["address"].casefold() == address.casefold()
+                or item["name"].casefold() == str(value.get("label", saved_name)).casefold()
+            ),
+            None,
+        )
+        if match:
+            matched_discovered.add(str(match["name"]).casefold())
+        hosts.append(
+            {
+                "id": saved_name,
+                "name": str(value.get("label") or saved_name),
+                "address": address,
+                "port": port,
+                "app": str(value.get("app") or profile["defaultApp"]),
+                "apps": apps_for(value, str(profile["defaultApp"])),
+                "preset": str(value.get("preset") or ""),
+                "saved": True,
+                "favorite": bool(value.get("favorite", False)),
+                "online": match is not None,
+            }
+        )
+
+    for item in discovered:
+        if str(item["name"]).casefold() in matched_discovered:
+            continue
+        if any(
+            item["address"].casefold() == str(value.get("address", "")).casefold()
+            for value in profile["hosts"].values()
+            if isinstance(value, dict)
+        ):
+            continue
+        hosts.append(
+            {
+                "id": endpoint(item["address"], int(item["port"])),
+                "name": item["name"],
+                "address": item["address"],
+                "port": int(item["port"]),
+                "app": profile["defaultApp"],
+                "apps": [profile["defaultApp"]],
+                "preset": "",
+                "saved": False,
+                "favorite": False,
+                "online": True,
+            }
+        )
+
+    hosts.sort(key=lambda item: (not item["favorite"], not item["online"], str(item["name"]).casefold()))
+    return {
+        "hosts": hosts,
+        "defaultApp": profile["defaultApp"],
+        "profileNames": list(config["profiles"].keys()),
+        "activeProfile": profile_name,
+        "presetNames": list(profile["presets"].keys()),
+        "presets": profile["presets"],
+        "discoveryError": discovery_error or "",
+        "moonlightInstalled": bool(shutil.which("moonlight") or shutil.which("moonlight-qt")),
+        "configPath": str(CONFIG_PATH),
+    }
+
+
+def moonlight_binary() -> str:
+    binary = shutil.which("moonlight") or shutil.which("moonlight-qt")
+    if not binary:
+        raise RuntimeError("Moonlight is not installed or is not on PATH")
+    return binary
+
+
+def stream_options(preset: dict[str, Any]) -> list[str]:
+    options: list[str] = []
+    resolution = str(preset.get("resolution") or "")
+    if resolution in {"720", "1080", "1440", "4K"}:
+        options.append(f"--{resolution}")
+    for key in ("fps", "bitrate"):
+        value = preset.get(key)
+        if value not in (None, ""):
+            options.extend([f"--{key}", str(value)])
+    display_mode = str(preset.get("displayMode") or "")
+    if display_mode in {"fullscreen", "borderless", "windowed"}:
+        options.extend(["--display-mode", display_mode])
+    video_codec = str(preset.get("videoCodec") or "")
+    if video_codec in {"auto", "AV1", "H.264", "HEVC"}:
+        options.extend(["--video-codec", video_codec])
+    if bool(preset.get("keepAwake")):
+        options.append("--keep-awake")
+    if "absoluteMouse" in preset:
+        options.append("--absolute-mouse" if bool(preset["absoluteMouse"]) else "--no-absolute-mouse")
+    return options
+
+
+def run_moonlight(
+    action: str,
+    target: str,
+    app: str | None = None,
+    pin: str | None = None,
+    csv: bool = False,
+    verbose: bool = False,
+    preset_name: str | None = None,
+    profile_name: str | None = None,
+) -> int:
+    config = load_config()
+    selected_profile, profile = profile_for_command(config, profile_name)
+    address, port, _, saved = resolve_target(config, target, selected_profile)
+    host = endpoint(address, port)
+    binary = moonlight_binary()
+    if action == "connect":
+        selected_preset_name = preset_name or (str(saved.get("preset")) if saved else "")
+        preset = profile["presets"].get(selected_preset_name, {}) if selected_preset_name else {}
+        selected_app = app or str(preset.get("app") or "") or (str(saved.get("app")) if saved else "") or str(profile["defaultApp"])
+        command = [binary, "stream"] + stream_options(preset) + [host, selected_app]
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return 0
+
+    command = [binary, action, host]
+    if action == "pair" and pin:
+        command.extend(["--pin", pin])
+    if action == "list" and csv:
+        command.append("--csv")
+    if action == "list" and verbose:
+        command.append("--verbose")
+    return subprocess.call(command)
+
+
+def parse_apps(raw: str | None, fallback: str) -> list[str]:
+    values = [item.strip() for item in (raw or "").split(",") if item.strip()]
+    if fallback and fallback not in values:
+        values.insert(0, fallback)
+    return values or [fallback]
+
+
+def add_profile_argument(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--profile", default=None, help="Use a named LAN/VPN profile")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="omarchy-moonlight-sunshine")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    for name in ("snapshot", "discover"):
+        command = sub.add_parser(name, help=f"{name.title()} Sunshine hosts")
+        command.add_argument("--wait", type=float, default=1.2)
+        command.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    profile_add = sub.add_parser("profile-add", help="Create a LAN/VPN profile")
+    profile_add.add_argument("name")
+    profile_add.add_argument("--from-profile", default=None)
+
+    profile_select = sub.add_parser("profile-select", help="Select the active LAN/VPN profile")
+    profile_select.add_argument("name")
+
+    profile_remove = sub.add_parser("profile-remove", help="Remove a LAN/VPN profile")
+    profile_remove.add_argument("name")
+
+    remember = sub.add_parser("remember", help="Save or update a friendly host alias")
+    remember.add_argument("name")
+    remember.add_argument("address")
+    remember.add_argument("--port", type=int, default=None)
+    remember.add_argument("--app", default="")
+    remember.add_argument("--apps", default=None, help="Comma-separated quick app buttons")
+    remember.add_argument("--label", default="")
+    remember.add_argument("--preset", default=None, help="Default streaming preset")
+    remember.add_argument("--favorite", action="store_true", default=None)
+    remember.add_argument("--unfavorite", action="store_false", dest="favorite", default=None)
+    add_profile_argument(remember)
+
+    forget = sub.add_parser("forget", help="Remove a saved host alias")
+    forget.add_argument("name")
+    add_profile_argument(forget)
+
+    set_app = sub.add_parser("set-app", help="Set the default streamed app for a saved host")
+    set_app.add_argument("name")
+    set_app.add_argument("app")
+    add_profile_argument(set_app)
+
+    set_apps = sub.add_parser("set-apps", help="Set quick app buttons for a saved host")
+    set_apps.add_argument("name")
+    set_apps.add_argument("apps", help="Comma-separated app names")
+    add_profile_argument(set_apps)
+
+    set_preset = sub.add_parser("set-preset", help="Set a saved host's default streaming preset")
+    set_preset.add_argument("name")
+    set_preset.add_argument("preset")
+    add_profile_argument(set_preset)
+
+    favorite = sub.add_parser("favorite", help="Pin or unpin a saved host")
+    favorite.add_argument("name")
+    favorite.add_argument("state", choices=("on", "off"))
+    add_profile_argument(favorite)
+
+    preset_add = sub.add_parser("preset-add", help="Create or update a streaming preset")
+    preset_add.add_argument("name")
+    preset_add.add_argument("--profile", default=None)
+    preset_add.add_argument("--resolution", choices=("720", "1080", "1440", "4K"), default="1080")
+    preset_add.add_argument("--fps", type=int, default=60)
+    preset_add.add_argument("--bitrate", type=int, default=20000)
+    preset_add.add_argument("--display-mode", choices=("fullscreen", "borderless", "windowed"), default="borderless")
+    preset_add.add_argument("--video-codec", choices=("auto", "AV1", "H.264", "HEVC"), default="auto")
+    preset_add.add_argument("--keep-awake", action="store_true")
+
+    preset_remove = sub.add_parser("preset-remove", help="Remove a custom streaming preset")
+    preset_remove.add_argument("name")
+    add_profile_argument(preset_remove)
+
+    connect = sub.add_parser("connect", help="Start a Moonlight stream")
+    connect.add_argument("target")
+    connect.add_argument("app", nargs="?")
+    connect.add_argument("--preset", default=None)
+    add_profile_argument(connect)
+
+    pair = sub.add_parser("pair", help="Pair Moonlight with a host")
+    pair.add_argument("target")
+    pair.add_argument("--pin")
+    add_profile_argument(pair)
+
+    listing = sub.add_parser("list", help="List installed Sunshine apps")
+    listing.add_argument("target")
+    listing.add_argument("--csv", action="store_true")
+    listing.add_argument("--verbose", action="store_true")
+    add_profile_argument(listing)
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        config = load_config()
+        if args.command in {"snapshot", "discover"}:
+            data = snapshot(config, args.wait)
+            if args.command == "discover" and not args.json:
+                for host in data["hosts"]:
+                    print(f"{host['name']}\t{host['address']}\t{host['port']}\t{host['app']}")
+            else:
+                print(json.dumps(data, sort_keys=True))
+            return 0
+
+        if args.command == "profile-add":
+            if args.name in config["profiles"]:
+                return fail(f"Profile '{args.name}' already exists")
+            source_name = args.from_profile or config["activeProfile"]
+            _, source = active_profile(config, source_name)
+            config["profiles"][args.name] = copy.deepcopy(source)
+            config["activeProfile"] = args.name
+            save_config(config)
+            return 0
+
+        if args.command == "profile-select":
+            active_profile(config, args.name)
+            config["activeProfile"] = args.name
+            save_config(config)
+            return 0
+
+        if args.command == "profile-remove":
+            if args.name not in config["profiles"]:
+                return fail(f"No profile named '{args.name}'")
+            if len(config["profiles"]) == 1:
+                return fail("Cannot remove the only profile")
+            del config["profiles"][args.name]
+            if config["activeProfile"] == args.name:
+                config["activeProfile"] = next(iter(config["profiles"]))
+            save_config(config)
+            return 0
+
+        if args.command == "remember":
+            if not args.name.strip() or not args.address.strip():
+                return fail("Host name and address are required")
+            profile_name, profile = profile_for_command(config, args.profile)
+            key = args.name.strip()
+            existing = profile["hosts"].get(key, {})
+            selected_app = args.app.strip() or str(existing.get("app") or profile["defaultApp"])
+            existing_apps = existing.get("apps", [])
+            if isinstance(existing_apps, list):
+                existing_apps = ",".join(str(item) for item in existing_apps)
+            profile["hosts"][key] = {
+                "address": args.address.strip(),
+                "port": args.port if args.port is not None else int(existing.get("port") or DEFAULT_PORT),
+                "app": selected_app,
+                "apps": parse_apps(args.apps if args.apps is not None else str(existing_apps), selected_app),
+                "label": args.label.strip() or str(existing.get("label") or key),
+                "preset": args.preset if args.preset is not None else str(existing.get("preset") or ""),
+                "favorite": bool(existing.get("favorite", False)) if args.favorite is None else bool(args.favorite),
+            }
+            save_config(config)
+            print(f"Saved {key} in profile {profile_name} ({CONFIG_PATH})")
+            return 0
+
+        if args.command in {"forget", "set-app", "set-apps", "set-preset", "favorite"}:
+            _, profile = profile_for_command(config, args.profile)
+            saved = saved_host(profile, args.name)
+            if not saved:
+                return fail(f"No saved host named '{args.name}'")
+            if args.command == "forget":
+                del profile["hosts"][saved[0]]
+            elif args.command == "set-app":
+                saved[1]["app"] = args.app
+                current_apps = saved[1].get("apps", [])
+                if isinstance(current_apps, list):
+                    current_apps = ",".join(str(item) for item in current_apps)
+                saved[1]["apps"] = parse_apps(str(current_apps), args.app)
+            elif args.command == "set-apps":
+                saved[1]["apps"] = parse_apps(args.apps, str(saved[1].get("app") or profile["defaultApp"]))
+            elif args.command == "set-preset":
+                if args.preset not in profile["presets"]:
+                    return fail(f"No preset named '{args.preset}'")
+                saved[1]["preset"] = args.preset
+            else:
+                saved[1]["favorite"] = args.state == "on"
+            save_config(config)
+            return 0
+
+        if args.command == "preset-add":
+            _, profile = profile_for_command(config, args.profile)
+            profile["presets"][args.name] = {
+                "resolution": args.resolution,
+                "fps": args.fps,
+                "bitrate": args.bitrate,
+                "displayMode": args.display_mode,
+                "videoCodec": args.video_codec,
+                "keepAwake": args.keep_awake,
+            }
+            save_config(config)
+            return 0
+
+        if args.command == "preset-remove":
+            _, profile = profile_for_command(config, args.profile)
+            if args.name in DEFAULT_PRESETS:
+                return fail("Built-in presets cannot be removed")
+            if args.name not in profile["presets"]:
+                return fail(f"No preset named '{args.name}'")
+            del profile["presets"][args.name]
+            save_config(config)
+            return 0
+
+        if args.command == "connect":
+            return run_moonlight("connect", args.target, args.app, preset_name=args.preset, profile_name=args.profile)
+        if args.command == "pair":
+            return run_moonlight("pair", args.target, pin=args.pin, profile_name=args.profile)
+        if args.command == "list":
+            return run_moonlight("list", args.target, csv=args.csv, verbose=args.verbose, profile_name=args.profile)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        return fail(str(exc))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
