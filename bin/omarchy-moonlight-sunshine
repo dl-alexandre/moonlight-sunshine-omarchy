@@ -9,10 +9,12 @@ import json
 import os
 import re
 import selectors
+import signal
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,8 @@ SERVICE = "_nvstream._tcp"
 MAX_CONFIG_BYTES = 512 * 1024
 MAX_DISCOVERY_OUTPUT_BYTES = 256 * 1024
 MAX_DISCOVERY_RECORDS = 64
+MAX_DNS_SD_LOOKUPS = 16
+DNS_SD_LOOKUP_TIMEOUT = 1.0
 MAX_LOOKUP_OUTPUT_BYTES = 64 * 1024
 MAX_SNAPSHOT_BYTES = 128 * 1024
 MAX_SNAPSHOT_HOSTS = 64
@@ -142,10 +146,31 @@ def profile_for_command(config: dict[str, Any], name: str | None) -> tuple[str, 
 
 
 def save_config(data: dict[str, Any]) -> None:
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = CONFIG_PATH.with_suffix(".tmp")
-    temp_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    temp_path.replace(CONFIG_PATH)
+    payload = (json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if len(payload) > MAX_CONFIG_BYTES:
+        raise RuntimeError(f"Configuration exceeds the {MAX_CONFIG_BYTES} byte safety limit")
+    CONFIG_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=CONFIG_PATH.parent,
+            prefix=f".{CONFIG_PATH.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            temporary_file.write(payload)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, CONFIG_PATH)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def clean(value: str) -> str:
@@ -155,6 +180,14 @@ def clean(value: str) -> str:
 def bounded_text(value: Any, fallback: str = "") -> str:
     text = str(value if value is not None else fallback).strip()
     return text[:MAX_TEXT_LENGTH]
+
+
+def valid_port(value: Any) -> int:
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_PORT
+    return port if 1 <= port <= 65535 else DEFAULT_PORT
 
 
 def limited_names(values: Any, limit: int) -> list[str]:
@@ -225,7 +258,13 @@ def run_bounded(command: list[str], timeout: float, max_bytes: int) -> tuple[str
         selector.unregister(process.stdout)
         selector.close()
         if process.poll() is None:
-            process.kill()
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.kill()
         process.wait()
         process.stdout.close()
 
@@ -258,10 +297,7 @@ def parse_avahi(output: str) -> list[dict[str, Any]]:
             continue
         key, value = property_match.groups()
         if key == "port":
-            try:
-                current[key] = int(value)
-            except ValueError:
-                current[key] = DEFAULT_PORT
+            current[key] = valid_port(value)
         else:
             current[key] = clean(value)
     if len(records) < MAX_DISCOVERY_RECORDS:
@@ -288,15 +324,14 @@ def discover_with_dns_sd(wait: float) -> tuple[list[dict[str, Any]], bool]:
         max_bytes=MAX_DISCOVERY_OUTPUT_BYTES,
     )
     records: list[dict[str, Any]] = []
-    for instance in parse_dns_sd_browse(browse_output):
-        try:
-            lookup_output, _, lookup_truncated = run_bounded(
-                ["dns-sd", "-L", instance, SERVICE, "local"],
-                timeout=2.5,
-                max_bytes=MAX_LOOKUP_OUTPUT_BYTES,
-            )
-        except subprocess.TimeoutExpired:
-            continue
+    for index, instance in enumerate(parse_dns_sd_browse(browse_output)):
+        if index >= MAX_DNS_SD_LOOKUPS:
+            break
+        lookup_output, _, lookup_truncated = run_bounded(
+            ["dns-sd", "-L", instance, SERVICE, "local"],
+            timeout=DNS_SD_LOOKUP_TIMEOUT,
+            max_bytes=MAX_LOOKUP_OUTPUT_BYTES,
+        )
         output_truncated = output_truncated or lookup_truncated
         match = re.search(r"can be reached at\s+([^\s:]+\.?):(\d+)", lookup_output)
         if not match:
@@ -306,7 +341,7 @@ def discover_with_dns_sd(wait: float) -> tuple[list[dict[str, Any]], bool]:
                 "name": instance,
                 "hostname": clean(match.group(1)),
                 "address": clean(match.group(1)),
-                "port": int(match.group(2)),
+                "port": valid_port(match.group(2)),
             }
         )
     return records[:MAX_DISCOVERY_RECORDS], output_truncated
@@ -348,7 +383,7 @@ def normalize_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "name": name,
             "hostname": clean(str(record.get("hostname") or address)),
             "address": address,
-            "port": int(record.get("port") or DEFAULT_PORT),
+            "port": valid_port(record.get("port")),
         }
         key = name.casefold()
         existing = by_name.get(key)
@@ -359,6 +394,7 @@ def normalize_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def endpoint(address: str, port: int = DEFAULT_PORT) -> str:
     address = clean(address)
+    port = valid_port(port)
     if ":" in address and not address.startswith("["):
         address = f"[{address}]"
     return address if port == DEFAULT_PORT else f"{address}:{port}"
@@ -368,11 +404,11 @@ def parse_endpoint(value: str) -> tuple[str, int]:
     value = value.strip()
     if value.startswith("[") and "]" in value:
         host, _, suffix = value[1:].partition("]")
-        return host, int(suffix[1:]) if suffix.startswith(":") and suffix[1:].isdigit() else DEFAULT_PORT
+        return host, valid_port(suffix[1:]) if suffix.startswith(":") and suffix[1:].isdigit() else DEFAULT_PORT
     if value.count(":") == 1:
         host, port = value.rsplit(":", 1)
         if port.isdigit():
-            return host, int(port)
+            return host, valid_port(port)
     return value, DEFAULT_PORT
 
 
@@ -393,7 +429,7 @@ def resolve_target(config: dict[str, Any], target: str, profile_name: str | None
         address = str(value.get("address", "")).strip()
         if not address:
             raise RuntimeError(f"Saved host '{name}' has no address")
-        port = int(value.get("port") or DEFAULT_PORT)
+        port = valid_port(value.get("port"))
         return address, port, name, value
     address, port = parse_endpoint(target)
     return address, port, target, None
@@ -424,7 +460,7 @@ def snapshot(config: dict[str, Any], wait: float) -> dict[str, Any]:
         address = str(value.get("address", "")).strip()
         if not address:
             continue
-        port = int(value.get("port") or DEFAULT_PORT)
+        port = valid_port(value.get("port"))
         match = next(
             (
                 item
@@ -464,10 +500,10 @@ def snapshot(config: dict[str, Any], wait: float) -> dict[str, Any]:
             continue
         hosts.append(
             {
-                "id": bounded_text(endpoint(item["address"], int(item["port"]))),
+                "id": bounded_text(endpoint(item["address"], valid_port(item["port"]))),
                 "name": bounded_text(item["name"], "Sunshine host"),
                 "address": bounded_text(item["address"]),
-                "port": int(item["port"]),
+                "port": valid_port(item["port"]),
                 "app": bounded_text(profile["defaultApp"], "Desktop"),
                 "apps": [bounded_text(profile["defaultApp"], "Desktop")],
                 "preset": "",
@@ -489,7 +525,6 @@ def snapshot(config: dict[str, Any], wait: float) -> dict[str, Any]:
         "presets": presets,
         "discoveryError": discovery_error or "",
         "moonlightInstalled": bool(shutil.which("moonlight") or shutil.which("moonlight-qt")),
-        "configPath": str(CONFIG_PATH),
     }
 
 
@@ -733,7 +768,7 @@ def main(argv: list[str]) -> int:
                 existing_apps = ",".join(str(item) for item in existing_apps)
             profile["hosts"][key] = {
                 "address": args.address.strip(),
-                "port": args.port if args.port is not None else int(existing.get("port") or DEFAULT_PORT),
+                "port": valid_port(args.port if args.port is not None else existing.get("port")),
                 "app": selected_app,
                 "apps": parse_apps(args.apps if args.apps is not None else str(existing_apps), selected_app),
                 "label": args.label.strip() or str(existing.get("label") or key),

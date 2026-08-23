@@ -27,7 +27,20 @@ friendly aliases in:
 ```
 
 Discovery is bounded to 64 hosts and 256 KiB of mDNS output. The helper's
-Quickshell snapshot is capped at 128 KiB before the bar reads it.
+Quickshell snapshot is capped at 128 KiB before the bar reads it. On macOS,
+at most 16 DNS-SD lookups are attempted, each with a one-second timeout.
+
+## Security and runtime scope
+
+Omarchy shell plugins run as unsandboxed user code inside the long-lived
+`omarchy-shell` process. This plugin reads and updates the local
+`hosts.json`, invokes locally installed `avahi-browse`/`dns-sd` and Moonlight
+commands, and does not download code, open URLs, or request privilege
+escalation. mDNS discovery is not authenticated; review discovered hosts
+before connecting, especially on shared networks. Discovery never connects
+automatically, and pairing PINs are not stored by this plugin (a PIN passed
+to the CLI may still be visible to local process inspection while Moonlight
+is running).
 
 Useful terminal commands:
 

@@ -29,7 +29,7 @@ Panel {
   property string statusText: "Scanning for Sunshine hosts…"
   property string label: "󰍹"
   property string tooltipText: "Moonlight Sunshine"
-  readonly property int maxSnapshotCharacters: 131072
+  readonly property int maxSnapshotCharacters: 131073
   property bool refreshing: false
 
   property bool profileFormVisible: false
