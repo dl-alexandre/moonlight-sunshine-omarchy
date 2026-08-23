@@ -3,11 +3,13 @@ import importlib.util
 import io
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 LOADER = importlib.machinery.SourceFileLoader(
@@ -65,6 +67,50 @@ class HardeningTests(unittest.TestCase):
                     {"large": "x" * MODULE.MAX_CONFIG_BYTES},
                 )
                 self.assertEqual(list(MODULE.CONFIG_PATH.parent.glob("*.tmp")), [])
+            finally:
+                MODULE.CONFIG_PATH = original_path
+
+    def test_config_read_is_bounded_without_path_preflight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original_path = MODULE.CONFIG_PATH
+            MODULE.CONFIG_PATH = Path(directory) / "moonlight-sunshine" / "hosts.json"
+            try:
+                with mock.patch.object(Path, "exists", side_effect=AssertionError), mock.patch.object(
+                    Path, "stat", side_effect=AssertionError
+                ):
+                    config = MODULE.load_config()
+                self.assertEqual(config["activeProfile"], "LAN")
+
+                MODULE.CONFIG_PATH.parent.mkdir()
+                MODULE.CONFIG_PATH.write_bytes(b"x" * (MODULE.MAX_CONFIG_BYTES + 1))
+                with mock.patch.object(
+                    MODULE.os,
+                    "fstat",
+                    return_value=SimpleNamespace(st_mode=stat.S_IFREG, st_size=0),
+                ), self.assertRaisesRegex(RuntimeError, "exceeds"):
+                    MODULE.load_config()
+            finally:
+                MODULE.CONFIG_PATH = original_path
+
+    def test_config_read_rejects_symlinks_and_special_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original_path = MODULE.CONFIG_PATH
+            config_path = Path(directory) / "moonlight-sunshine" / "hosts.json"
+            MODULE.CONFIG_PATH = config_path
+            try:
+                config_path.parent.mkdir()
+                target = config_path.parent / "real-hosts.json"
+                target.write_text('{"profiles":{"LAN":{"hosts":{}}}}', encoding="utf-8")
+                config_path.symlink_to(target)
+                with self.assertRaisesRegex(RuntimeError, "Cannot read"):
+                    MODULE.load_config()
+
+                config_path.unlink()
+                fifo_path = config_path.parent / "hosts.fifo"
+                os.mkfifo(fifo_path)
+                MODULE.CONFIG_PATH = fifo_path
+                with self.assertRaisesRegex(RuntimeError, "regular file"):
+                    MODULE.load_config()
             finally:
                 MODULE.CONFIG_PATH = original_path
 

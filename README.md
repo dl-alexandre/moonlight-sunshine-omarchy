@@ -27,8 +27,10 @@ friendly aliases in:
 ```
 
 Discovery is bounded to 64 hosts and 256 KiB of mDNS output. The helper's
-Quickshell snapshot is capped at 128 KiB before the bar reads it. On macOS,
-at most 16 DNS-SD lookups are attempted, each with a one-second timeout.
+Quickshell snapshot is capped at 128 KiB before the bar reads it. The config
+file is opened once as a regular, no-follow file and read within the 512 KiB
+limit. On macOS, at most 16 DNS-SD lookups are attempted, each with a
+one-second timeout.
 
 ## Security and runtime scope
 

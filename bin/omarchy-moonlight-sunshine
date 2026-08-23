@@ -12,6 +12,7 @@ import selectors
 import signal
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -77,17 +78,57 @@ def fail(message: str, code: int = 1) -> int:
     return code
 
 
+def read_config_bytes() -> bytes | None:
+    """Read the config through one bounded, no-follow file descriptor."""
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_NONBLOCK"):
+        raise RuntimeError(f"Cannot safely read {CONFIG_PATH}: required file-open flags are unavailable")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | os.O_NONBLOCK
+        | os.O_NOFOLLOW
+    )
+    try:
+        descriptor = os.open(CONFIG_PATH, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read {CONFIG_PATH}: {exc}") from exc
+
+    try:
+        file_info = os.fstat(descriptor)
+        if not stat.S_ISREG(file_info.st_mode):
+            raise RuntimeError(f"Invalid config in {CONFIG_PATH}: expected a regular file")
+        if file_info.st_size > MAX_CONFIG_BYTES:
+            raise RuntimeError(f"Configuration exceeds the {MAX_CONFIG_BYTES} byte safety limit")
+
+        payload = bytearray()
+        while len(payload) <= MAX_CONFIG_BYTES:
+            chunk = os.read(descriptor, MAX_CONFIG_BYTES + 1 - len(payload))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        if len(payload) > MAX_CONFIG_BYTES:
+            raise RuntimeError(f"Configuration exceeds the {MAX_CONFIG_BYTES} byte safety limit")
+        return bytes(payload)
+    except RuntimeError:
+        raise
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read {CONFIG_PATH}: {exc}") from exc
+    finally:
+        os.close(descriptor)
+
+
 def load_config() -> dict[str, Any]:
-    if not CONFIG_PATH.exists():
+    raw_config = read_config_bytes()
+    if raw_config is None:
         return {
             "activeProfile": "LAN",
             "profiles": {"LAN": default_profile()},
         }
     try:
-        if CONFIG_PATH.stat().st_size > MAX_CONFIG_BYTES:
-            raise RuntimeError(f"Configuration exceeds the {MAX_CONFIG_BYTES} byte safety limit")
-        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        data = json.loads(raw_config.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Cannot read {CONFIG_PATH}: {exc}") from exc
     if not isinstance(data, dict):
         raise RuntimeError(f"Invalid config in {CONFIG_PATH}: expected an object")
