@@ -26,6 +26,9 @@ friendly aliases in:
 ~/.config/moonlight-sunshine/hosts.json
 ```
 
+Discovery is bounded to 64 hosts and 256 KiB of mDNS output. The helper's
+Quickshell snapshot is capped at 128 KiB before the bar reads it.
+
 Useful terminal commands:
 
 ```bash

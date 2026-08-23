@@ -8,16 +8,28 @@ import copy
 import json
 import os
 import re
+import selectors
 import shutil
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 
 DEFAULT_PORT = 47989
 SERVICE = "_nvstream._tcp"
+MAX_CONFIG_BYTES = 512 * 1024
+MAX_DISCOVERY_OUTPUT_BYTES = 256 * 1024
+MAX_DISCOVERY_RECORDS = 64
+MAX_LOOKUP_OUTPUT_BYTES = 64 * 1024
+MAX_SNAPSHOT_BYTES = 128 * 1024
+MAX_SNAPSHOT_HOSTS = 64
+MAX_PROFILE_NAMES = 32
+MAX_PRESET_NAMES = 32
+MAX_APPS_PER_HOST = 16
+MAX_TEXT_LENGTH = 512
 DEFAULT_PRESETS: dict[str, dict[str, Any]] = {
     "Gaming": {
         "resolution": "1440",
@@ -68,7 +80,9 @@ def load_config() -> dict[str, Any]:
             "profiles": {"LAN": default_profile()},
         }
     try:
-        data = json.loads(CONFIG_PATH.read_text())
+        if CONFIG_PATH.stat().st_size > MAX_CONFIG_BYTES:
+            raise RuntimeError(f"Configuration exceeds the {MAX_CONFIG_BYTES} byte safety limit")
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Cannot read {CONFIG_PATH}: {exc}") from exc
     if not isinstance(data, dict):
@@ -138,6 +152,86 @@ def clean(value: str) -> str:
     return value.strip().rstrip(".")
 
 
+def bounded_text(value: Any, fallback: str = "") -> str:
+    text = str(value if value is not None else fallback).strip()
+    return text[:MAX_TEXT_LENGTH]
+
+
+def limited_names(values: Any, limit: int) -> list[str]:
+    names: list[str] = []
+    for value in values:
+        if len(names) >= limit:
+            break
+        names.append(bounded_text(value))
+    return names
+
+
+def safe_preset(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    safe: dict[str, Any] = {}
+    for key in ("resolution", "fps", "bitrate", "displayMode", "videoCodec", "keepAwake", "absoluteMouse", "app"):
+        if key not in value:
+            continue
+        item = value[key]
+        safe[key] = item if isinstance(item, (bool, int, float)) or item is None else bounded_text(item)
+    return safe
+
+
+def run_bounded(command: list[str], timeout: float, max_bytes: int) -> tuple[str, bool, bool]:
+    """Run a discovery command without retaining unbounded stdout or stderr."""
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    if process.stdout is None:
+        process.kill()
+        process.wait()
+        return "", False, False
+
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    chunks: list[bytes] = []
+    total = 0
+    timed_out = False
+    truncated = False
+    deadline = time.monotonic() + max(0.1, timeout)
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = process.poll() is None
+                break
+            if not selector.select(remaining):
+                timed_out = process.poll() is None
+                break
+            read_size = max(1, min(64 * 1024, max_bytes - total + 1))
+            chunk = os.read(process.stdout.fileno(), read_size)
+            if not chunk:
+                break
+            allowed = max_bytes - total
+            if len(chunk) > allowed:
+                chunks.append(chunk[:allowed])
+                truncated = True
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= max_bytes:
+                truncated = True
+                break
+    finally:
+        selector.unregister(process.stdout)
+        selector.close()
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        process.stdout.close()
+
+    return b"".join(chunks).decode("utf-8", errors="replace"), timed_out, truncated
+
+
 def parse_avahi(output: str) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
@@ -150,6 +244,8 @@ def parse_avahi(output: str) -> list[dict[str, Any]]:
         current = None
 
     for line in output.splitlines():
+        if len(records) >= MAX_DISCOVERY_RECORDS:
+            break
         match = header.match(line.strip())
         if match:
             flush()
@@ -168,41 +264,41 @@ def parse_avahi(output: str) -> list[dict[str, Any]]:
                 current[key] = DEFAULT_PORT
         else:
             current[key] = clean(value)
-    flush()
-    return records
+    if len(records) < MAX_DISCOVERY_RECORDS:
+        flush()
+    return records[:MAX_DISCOVERY_RECORDS]
 
 
 def parse_dns_sd_browse(output: str) -> list[str]:
     instances: list[str] = []
     pattern = re.compile(r"\bAdd\s+\d+\s+\d+\s+(.+?)\s+_nvstream\._tcp\.\s+local\.?$")
     for line in output.splitlines():
+        if len(instances) >= MAX_DISCOVERY_RECORDS:
+            break
         match = pattern.search(line.strip())
         if match and match.group(1) not in instances:
             instances.append(match.group(1))
-    return instances
+    return instances[:MAX_DISCOVERY_RECORDS]
 
 
-def discover_with_dns_sd(wait: float) -> list[dict[str, Any]]:
-    browse = subprocess.run(
+def discover_with_dns_sd(wait: float) -> tuple[list[dict[str, Any]], bool]:
+    browse_output, _, output_truncated = run_bounded(
         ["dns-sd", "-B", SERVICE, "local"],
-        capture_output=True,
-        text=True,
         timeout=max(1.0, wait) + 1.5,
-        check=False,
+        max_bytes=MAX_DISCOVERY_OUTPUT_BYTES,
     )
     records: list[dict[str, Any]] = []
-    for instance in parse_dns_sd_browse(browse.stdout):
+    for instance in parse_dns_sd_browse(browse_output):
         try:
-            lookup = subprocess.run(
+            lookup_output, _, lookup_truncated = run_bounded(
                 ["dns-sd", "-L", instance, SERVICE, "local"],
-                capture_output=True,
-                text=True,
                 timeout=2.5,
-                check=False,
+                max_bytes=MAX_LOOKUP_OUTPUT_BYTES,
             )
         except subprocess.TimeoutExpired:
             continue
-        match = re.search(r"can be reached at\s+([^\s:]+\.?):(\d+)", lookup.stdout)
+        output_truncated = output_truncated or lookup_truncated
+        match = re.search(r"can be reached at\s+([^\s:]+\.?):(\d+)", lookup_output)
         if not match:
             continue
         records.append(
@@ -213,28 +309,29 @@ def discover_with_dns_sd(wait: float) -> list[dict[str, Any]]:
                 "port": int(match.group(2)),
             }
         )
-    return records
+    return records[:MAX_DISCOVERY_RECORDS], output_truncated
 
 
 def discover(wait: float) -> tuple[list[dict[str, Any]], str | None]:
     if shutil.which("avahi-browse"):
         try:
-            result = subprocess.run(
+            output, _, truncated = run_bounded(
                 ["avahi-browse", "-rt", SERVICE],
-                capture_output=True,
-                text=True,
                 timeout=max(1.0, wait) + 2.0,
-                check=False,
+                max_bytes=MAX_DISCOVERY_OUTPUT_BYTES,
             )
-            return normalize_records(parse_avahi(result.stdout)), None
-        except subprocess.TimeoutExpired as exc:
-            return normalize_records(parse_avahi(exc.stdout or "")), None
+            error = "mDNS scan output exceeded the safety limit" if truncated else None
+            return normalize_records(parse_avahi(output)), error
+        except subprocess.SubprocessError:
+            return [], "mDNS scan failed"
 
     if shutil.which("dns-sd"):
         try:
-            return normalize_records(discover_with_dns_sd(wait)), None
-        except subprocess.TimeoutExpired:
-            return [], "mDNS scan timed out"
+            records, truncated = discover_with_dns_sd(wait)
+            error = "mDNS scan output exceeded the safety limit" if truncated else None
+            return normalize_records(records), error
+        except subprocess.SubprocessError:
+            return [], "mDNS scan failed"
 
     return [], "Install avahi (Linux) or use macOS dns-sd for automatic discovery"
 
@@ -242,7 +339,7 @@ def discover(wait: float) -> tuple[list[dict[str, Any]], str | None]:
 def normalize_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Collapse IPv4/IPv6 duplicates while preferring an IPv4 address."""
     by_name: dict[str, dict[str, Any]] = {}
-    for record in records:
+    for record in records[:MAX_DISCOVERY_RECORDS]:
         name = clean(str(record.get("name") or record.get("hostname") or "Sunshine host"))
         address = clean(str(record.get("address") or record.get("hostname") or ""))
         if not address:
@@ -257,7 +354,7 @@ def normalize_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         existing = by_name.get(key)
         if existing is None or (":" in str(existing["address"]) and ":" not in address):
             by_name[key] = candidate
-    return sorted(by_name.values(), key=lambda item: str(item["name"]).casefold())
+    return sorted(by_name.values(), key=lambda item: str(item["name"]).casefold())[:MAX_DISCOVERY_RECORDS]
 
 
 def endpoint(address: str, port: int = DEFAULT_PORT) -> str:
@@ -312,13 +409,16 @@ def snapshot(config: dict[str, Any], wait: float) -> dict[str, Any]:
         raw_apps = value.get("apps", [])
         if isinstance(raw_apps, str):
             raw_apps = raw_apps.split(",")
-        apps = [str(item).strip() for item in raw_apps if str(item).strip()]
-        selected = str(value.get("app") or default_app).strip()
+        apps = [bounded_text(item) for item in raw_apps if bounded_text(item)]
+        apps = apps[:MAX_APPS_PER_HOST]
+        selected = bounded_text(value.get("app") or default_app)
         if selected and selected not in apps:
             apps.insert(0, selected)
-        return apps or [default_app]
+        return apps[:MAX_APPS_PER_HOST] or [bounded_text(default_app, "Desktop")]
 
     for saved_name, value in profile["hosts"].items():
+        if len(hosts) >= MAX_SNAPSHOT_HOSTS:
+            break
         if not isinstance(value, dict):
             continue
         address = str(value.get("address", "")).strip()
@@ -338,13 +438,13 @@ def snapshot(config: dict[str, Any], wait: float) -> dict[str, Any]:
             matched_discovered.add(str(match["name"]).casefold())
         hosts.append(
             {
-                "id": saved_name,
-                "name": str(value.get("label") or saved_name),
-                "address": address,
+                "id": bounded_text(saved_name),
+                "name": bounded_text(value.get("label") or saved_name, "Sunshine host"),
+                "address": bounded_text(address),
                 "port": port,
-                "app": str(value.get("app") or profile["defaultApp"]),
+                "app": bounded_text(value.get("app") or profile["defaultApp"], "Desktop"),
                 "apps": apps_for(value, str(profile["defaultApp"])),
-                "preset": str(value.get("preset") or ""),
+                "preset": bounded_text(value.get("preset") or ""),
                 "saved": True,
                 "favorite": bool(value.get("favorite", False)),
                 "online": match is not None,
@@ -352,6 +452,8 @@ def snapshot(config: dict[str, Any], wait: float) -> dict[str, Any]:
         )
 
     for item in discovered:
+        if len(hosts) >= MAX_SNAPSHOT_HOSTS:
+            break
         if str(item["name"]).casefold() in matched_discovered:
             continue
         if any(
@@ -362,12 +464,12 @@ def snapshot(config: dict[str, Any], wait: float) -> dict[str, Any]:
             continue
         hosts.append(
             {
-                "id": endpoint(item["address"], int(item["port"])),
-                "name": item["name"],
-                "address": item["address"],
+                "id": bounded_text(endpoint(item["address"], int(item["port"]))),
+                "name": bounded_text(item["name"], "Sunshine host"),
+                "address": bounded_text(item["address"]),
                 "port": int(item["port"]),
-                "app": profile["defaultApp"],
-                "apps": [profile["defaultApp"]],
+                "app": bounded_text(profile["defaultApp"], "Desktop"),
+                "apps": [bounded_text(profile["defaultApp"], "Desktop")],
                 "preset": "",
                 "saved": False,
                 "favorite": False,
@@ -376,13 +478,15 @@ def snapshot(config: dict[str, Any], wait: float) -> dict[str, Any]:
         )
 
     hosts.sort(key=lambda item: (not item["favorite"], not item["online"], str(item["name"]).casefold()))
+    preset_items = list(profile["presets"].items())[:MAX_PRESET_NAMES]
+    presets = {bounded_text(name): safe_preset(value) for name, value in preset_items}
     return {
         "hosts": hosts,
-        "defaultApp": profile["defaultApp"],
-        "profileNames": list(config["profiles"].keys()),
-        "activeProfile": profile_name,
-        "presetNames": list(profile["presets"].keys()),
-        "presets": profile["presets"],
+        "defaultApp": bounded_text(profile["defaultApp"], "Desktop"),
+        "profileNames": limited_names(config["profiles"], MAX_PROFILE_NAMES),
+        "activeProfile": bounded_text(profile_name, "LAN"),
+        "presetNames": limited_names(profile["presets"], MAX_PRESET_NAMES),
+        "presets": presets,
         "discoveryError": discovery_error or "",
         "moonlightInstalled": bool(shutil.which("moonlight") or shutil.which("moonlight-qt")),
         "configPath": str(CONFIG_PATH),
@@ -394,6 +498,27 @@ def moonlight_binary() -> str:
     if not binary:
         raise RuntimeError("Moonlight is not installed or is not on PATH")
     return binary
+
+
+def emit_json(data: dict[str, Any]) -> None:
+    """Emit a snapshot bounded for the Quickshell process reader."""
+    encoded = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > MAX_SNAPSHOT_BYTES:
+        encoded = json.dumps(
+            {
+                "hosts": [],
+                "profileNames": ["LAN"],
+                "activeProfile": "LAN",
+                "presetNames": ["Desktop"],
+                "presets": {"Desktop": safe_preset(DEFAULT_PRESETS["Desktop"])},
+                "defaultApp": "Desktop",
+                "discoveryError": "Snapshot exceeded the safety limit",
+                "moonlightInstalled": bool(shutil.which("moonlight") or shutil.which("moonlight-qt")),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    sys.stdout.buffer.write(encoded[:MAX_SNAPSHOT_BYTES] + b"\n")
 
 
 def stream_options(preset: dict[str, Any]) -> list[str]:
@@ -566,7 +691,7 @@ def main(argv: list[str]) -> int:
                 for host in data["hosts"]:
                     print(f"{host['name']}\t{host['address']}\t{host['port']}\t{host['app']}")
             else:
-                print(json.dumps(data, sort_keys=True))
+                emit_json(data)
             return 0
 
         if args.command == "profile-add":

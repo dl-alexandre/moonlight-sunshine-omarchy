@@ -29,6 +29,7 @@ Panel {
   property string statusText: "Scanning for Sunshine hosts…"
   property string label: "󰍹"
   property string tooltipText: "Moonlight Sunshine"
+  readonly property int maxSnapshotCharacters: 131072
   property bool refreshing: false
 
   property bool profileFormVisible: false
@@ -149,8 +150,14 @@ Panel {
   }
 
   function parseSnapshot(raw) {
+    var snapshotText = String(raw || "")
+    if (snapshotText.length > root.maxSnapshotCharacters) {
+      root.refreshing = false
+      root.statusText = "Sunshine scan response exceeded the safety limit"
+      return
+    }
     try {
-      var data = JSON.parse(String(raw || "{}"))
+      var data = JSON.parse(snapshotText || "{}")
       root.hosts = data.hosts || []
       root.profileNames = data.profileNames || [data.activeProfile || "LAN"]
       root.activeProfile = data.activeProfile || root.profileNames[0] || "LAN"
@@ -162,9 +169,8 @@ Panel {
       var discovered = root.hosts.filter(function(host) { return host.online }).length
       var count = root.hosts.length
       root.label = count > 0 ? "󰍹 " + count : "󰍹"
-      root.tooltipText = count > 0
-        ? root.activeProfile + " · " + count + " Sunshine host" + (count === 1 ? "" : "s")
-        : "No Sunshine hosts discovered"
+      // Keep user-controlled profile names out of the shared bar tooltip.
+      root.tooltipText = "Moonlight Sunshine"
       if (data.moonlightInstalled !== true)
         root.statusText = "Moonlight is not installed on this client"
       else if (data.discoveryError)
